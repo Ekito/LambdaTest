@@ -1,0 +1,25 @@
+swagger: '2.0'
+info:
+  version: '1'
+  title: Lambda Test
+  description: A hello world API testing AWS API Gateway + Lambda
+
+paths:
+  /hello/{firstName}:
+    get:
+      consumes:
+      - application/json
+      produces:
+      - text/html
+      responses:
+        200:
+          description: "200 response"
+          headers:
+            Content-Type:
+              type: string
+      parameters:
+        - name: firstName
+          in: path
+          description: first name
+          required: true
+          type: string
