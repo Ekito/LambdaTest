@@ -1,0 +1,317 @@
+<p style="text-align: justified;">
+A recent article about <a href="http://martinfowler.com/articles/serverless.html" target="_blank">Serverless Architectures</a> by Mike Roberts as well as ekito's commitment to developing <a href="https://nowave.io" target="_blank">nowave.io</a>, whose architecture is partly a serverless, inspired me on having my own take on Serverless Architectures based on FaaS (Functions as a Service).
+    </p>
+<p style="text-align: justified;">
+At first I will describe how I developed a Hello World FaaS that is triggered by a REST API. The API is declaratively defined using a <a href="http://swagger.io" target="_blank">swagger.io</a> description in a contract first approach. It is deployed to Amazon's <a href="https://aws.amazon.com/api-gateway/" target="_blank">API Gateway</a>. In the gateway, a mapping is configured extracting data from API requests and transforming them to event objects that are passed to Amazon's FaaS infrastructure called <a href="https://aws.amazon.com/lambda/details/" target="_blank">Amazon Lambda</a>.
+</p>
+
+<p style="text-align: justified;">
+In the second part I will provide some feedback on load testing the service I developed. This part includes some insights to observed round trip latencies and rate limiting behaviours.
+</p>
+
+<p style="text-align: justified;">
+But first what's all that fuss about FaaS?
+</p>
+
+<h1>FaaS</h1>
+
+<p style="text-align: justified;">
+A Function as a Service (FaaS) is some stateless business logic that is triggered by a stimulus, for example an event. The logic of the function is applied to its inputs; the result is returned. FaaS can have side effects. For example, they can trigger another function or communicate with third party services.
+</p>
+
+<p style="text-align: justified;">
+For FaaS to execute, they are bound to triggers. Therefore they become versatile building blocks that can act as a stored procedure on database tables, be triggered on file system changes, act as workers on messaging queues or act as controllers behind a REST API.
+</p>
+
+<p style="text-align: justified;">
+FaaS are packaged and deployed to a cloud provider. FaaS usage is generally billed by the number of function invocations and by computing resources consumed during the execution of a function call.
+</p>
+
+<p style="text-align: justified;">
+What makes FaaS so attractive is their simple programming, packaging and deployment model, but also their capacity of being natively elastic, resulting in linear scalability in terms of performance and operational costs. Furthermore, the FaaS deployment model does not require any execution platform, middleware, container or virtual machine. Operational maintenance is completely outsourced to the cloud provider (NoOps).
+</p>
+
+<h1>Building the HelloWorld function</h1>
+
+<p style="text-align: justified;">
+Amazon Lambda accepts functions implemented in JavaScript (Node.js), Python or Java 8. By consequence, it is also possible to write a function in Scala or any other programming language that is based on Java 8.
+</p>
+
+<p style="text-align: justified;">
+Willing to write a little bit of Scala again, I decided to follow this <a href="https://aws.amazon.com/blogs/compute/writing-aws-lambda-functions-in-scala/" target="_blank">blog entry</a> for implementing my function.
+</p>
+
+<h2>Project Initialization</h2>
+
+<p style="text-align: justified;">
+First, let's initialize a Scala project with the following <code>build.sbt</code> file at the project's root:
+</p>
+
+<pre lang="scala" line="1" escaped="true">
+name := "AWSLambdaTest"
+
+version := "1.0"
+
+scalaVersion := "2.11.8"
+
+libraryDependencies += "com.amazonaws" % "aws-lambda-java-core" % "1.1.0"
+libraryDependencies += "com.fasterxml.jackson.module" % "jackson-module-scala_2.11" % "2.7.5"
+
+javacOptions ++= Seq("-source", "1.8", "-target", "1.8", "-Xlint")
+
+assemblyMergeStrategy in assembly := {
+  case PathList("META-INF", xs@_*) =&gt; MergeStrategy.discard
+  case x =&gt; MergeStrategy.first
+}
+</pre>
+
+<p style="text-align: justified;">
+Note here that we instruct sbt expressively to build Java 8 byte code. Furthermore, the assembly strategy for the <a href="https://github.com/sbt/sbt-assembly">SBT assembly plugin</a> is configured.
+</p>
+<p style="text-align: justified;">
+The assembly plugin is configured in <code>LambdaTest/project/plugins.sbt</code> as follows:
+</p>
+
+<pre lang="scala" line="1" escaped="true">addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "0.14.3")</pre>
+
+<p style="text-align: justified;">
+The project is built and packaged with the command <code>sbt assembly</code>. The resulting jar can be found at <code>LambdaTest/target/scala-2.11/AWSLambdaTest-assembly-1.0.jar</code>.
+</p>
+<p style="text-align: justified;">
+What struck me was the size of the jar file (12.4MB) given that we are writing a mere hello world function. It turns out that all Scala byte code classes are included in the jar. In practical terms this size can have an impact on the upload duration to AWS (timeout after 61s) and the <a href="http://docs.aws.amazon.com/lambda/latest/dg/limits.html">number of functions</a> that can be deployed per user account and region (max. storage space for all lambdas in one region is 1.5GB). Should this really become impacting, consider spreading your deployments across different regions, using directly Java 8 or an interpreted language with a smaller footprint (Node.js or Python).
+</p>
+
+<h2>Programming model</h2>
+
+<p style="text-align: justified;">
+Functions are implemented within a handler with a name of your choice. The function signature can take several forms, always defining an input and an output. Amazon Lambda allows for the following <a href="http://docs.aws.amazon.com/lambda/latest/dg/java-programming-model-handler-types.html" target="_blank">input and output</a> types:
+</p>
+
+<ul>
+    <li>Simple Java types (AWS Lambda supports the String, Integer, Boolean, Map, and List types)</li>
+    <li>POJO (Plain Old Java Object) type</li>
+    <li>Stream types (InputStream / OutputStream)</li>
+</ul>
+
+<p style="text-align: justified;">
+When invoking a Lambda function asynchronously, any return value by the Lambda function will be ignored. It is encouraged to use the `void` return type.
+</p>
+<p style="text-align: justified;">
+When using POJOs, Amazon Lambda serializes and deserializes based on standard bean naming conventions. Mutable POJOs with public getters and setters must be used. Annotations are ignored.
+</p>
+<p style="text-align: justified;">
+When developing AWS Lambdas in Scala, type conversions between Scalaisms and Javaisms must be implemented. Alternatively, stream types for inputs and outputs can be used. In that case, marshalling and unmarshalling JSON is realized within the Lambda. While this approach seems a little cumbersome it is in my opinion the most stable strategy when opting for Scala. I am not inventing anything here, its coming straight from this <a href="https://aws.amazon.com/blogs/compute/writing-aws-lambda-functions-in-scala/" target="_blank">tutorial</a> I was following.
+</p>
+
+<pre lang="scala" line="1" escaped="true">
+package io.ekito.lambdaTest
+
+case class NameInfo(firstName: String, lastName: String)
+
+class Main {
+
+  import java.io.{InputStream, OutputStream}
+
+
+  val scalaMapper = {
+    import com.fasterxml.jackson.databind.ObjectMapper
+    import com.fasterxml.jackson.module.scala.DefaultScalaModule
+    new ObjectMapper().registerModule(new DefaultScalaModule)
+  }
+
+  def hello(input: InputStream, output: OutputStream): Unit = {
+    val name = scalaMapper.readValue(input, classOf[NameInfo])
+    val result = s"Greetings ${name.firstName} ${name.lastName}."
+    output.write(result.getBytes("UTF-8"))
+  }
+}</pre>
+
+<p style="text-align: justified;">
+The complete source code is available on <a href="https://github.com/Ekito/LambdaTest" target="_blank">Github</a>.
+</p>
+
+<h2>Deployment</h2>
+
+<p style="text-align: justified;">
+With the code in place, call:
+</p>
+
+<pre lang="sh" line="1" escaped="true">$&gt; sbt assemby</pre>
+
+<p style="text-align: justified;">
+Now lets deploy the artifact. You can do this via the CLI or the console; below I’ve illustrated what it looks like in the AWS console. Skip the steps 'Select BluePrint' and 'Configure Triggers' to arrive at the following screen:
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen1.png" rel="attachment wp-att-9164"><img class="alignnone wp-image-9164 size-full" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen1.png" alt="screen1" width="1635" height="1573" /></a>
+
+<p style="text-align: justified;">
+I am using the default suggestions for memory, duration, and role (basic execution). Note the handler: <code>io.ekito.lambdaTest.Main::hello</code>. Click 'Create Lambda function' and you should be ready to test.
+</p>
+
+<h2>Testing</h2>
+
+<p style="text-align: justified;">
+At this point the function should be fully operational. First configure a JSON object of the test event:
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_test_event.png" rel="attachment wp-att-9162"><img class="aligncenter wp-image-9162 size-full" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_test_event.png" alt="screen_test_event" width="1123" height="1062" /></a>
+
+<p style="text-align: justified;">
+Now you can test it by sending a JSON event object as illustrated here:
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_test_result.png" rel="attachment wp-att-9161"><img class="aligncenter wp-image-9161 size-full" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_test_result.png" alt="screen_test_result" width="2633" height="1207" /></a>
+
+<p style="text-align: justified;">
+What's interesting here is information about execution duration, billed duration the used memory. Based on those values, we can reduce the amount of configured memory from 512MB to 128MB. Interesting is also that an initial invocation can take up to 2s. There is somewhat of a warmup taking place. Execution times upon subsequent invocations are pretty short: ~ 0.6ms. However, the smallest billed period being 100ms, Amazon bills us for resources that we are actually not using :-|
+</p>
+
+<h2>REST API definition</h2>
+
+<p style="text-align: justified;">
+Using Swagger's API description language, lets wrtie a little Hello World REST API with one GET operation. I used [Swaggerhub.com](https://swaggerhub.com). Its an online editor with inline syntax and grammar validation. It also has an API documentation preview.
+</p>
+
+<pre lang="yaml" line="1" escaped="true">
+swagger: '2.0'
+info:
+  version: '1'
+  title: Lambda Test
+  description: A hello world API testing AWS API Gateway + Lambda
+
+paths:
+  /hello/{firstName}:
+    get:
+      consumes:
+      - application/json
+      produces:
+      - text/html
+      responses:
+        200:
+          description: "200 response"
+          headers:
+            Content-Type:
+              type: string
+      parameters:
+        - name: firstName
+          in: path
+          description: first name
+          required: true
+          type: string
+</pre>
+
+<h2>API Gateway</h2>
+
+<p style="text-align: justified;">
+In Amazon API Gateway, create a new API by pasting the previously created API definition.
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_api-definition.png" rel="attachment wp-att-9160"><img class="alignnone size-full wp-image-9160" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen_api-definition.png" alt="screen_api-definition" width="1937" height="880" /></a>
+
+<p style="text-align: justified;">
+Now, link the operation <code>/hello/{firstName}/GET</code>, with our lambda function.
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-api_linking.png" rel="attachment wp-att-9159"><img class="alignnone size-full wp-image-9159" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-api_linking.png" alt="screen api_linking" width="1967" height="577" /></a>
+
+<p style="text-align: justified;">
+With the API operation being linked to the lambda function a final step is necessary: The request's parameters must be transformed into a JSON event object, compatible with the input parameter of our lambda's handler function. The call flow is visualized hereafter:
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-call-flow.png" rel="attachment wp-att-9158"><img class="alignnone size-full wp-image-9158" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-call-flow.png" alt="screen call flow" width="1935" height="711" /></a>
+
+<p style="text-align: justified;">
+Click on 'Integration Request' inorder to define the mapping. Several mappings can be defined depending on the request's <code>Content-Type</code> header argument. We are defining one template for the content type <code>application/json</code>.
+</p>
+
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-mapping.png" rel="attachment wp-att-9157"><img class="alignnone size-full wp-image-9157" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-mapping.png" alt="screen mapping" width="1937" height="1375" /></a>
+
+<p style="text-align: justified;">
+The mapping can include all request parameters, payloads or header attributes. In our example, we are injecting the path variable <code>firstName</code>. The full documentation for request and response mapping can be <a href="http://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html" target="_blank">found here</a>.
+</p>
+<p style="text-align: justified;">
+With the mapping in place, we can now test the integration:
+</p>
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-test-api-gateway.png" rel="attachment wp-att-9156"><img class="alignnone size-full wp-image-9156" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-test-api-gateway.png" alt="screen test api gateway" width="1905" height="834" /></a>
+<p style="text-align: justified;">
+A final step consists in deploying the API. Deployments are created in stages allowing for deployment of different versions of the same API. With the seamless scalability of the service, Rate and burt limits are crucial to define the capacity of your service and to protect your bank account ;-) On the top of the page, the public URL is displayed.
+</p>
+<a href="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-deployment.png" rel="attachment wp-att-9155"><img class="alignnone size-full wp-image-9155" src="https://www.ekito.fr/people/wp-content/uploads/2016/07/screen-deployment.png" alt="screen deployment" width="1938" height="1054" /></a>
+
+<h1>Load testing</h1>
+<p style="text-align: justified;">
+Now its time to load test our public FaaS service. But wait, Amazon's API gateway uses SSL termination with TLSV1.2 encryption and <a href="https://en.wikipedia.org/wiki/Server_Name_Indication" target="_blank">Server Name Indication</a>. SNI is a TLS protocol extension that unfortunately not a lot of load testing tools support. As of the time of writing <a href="https://httpd.apache.org/docs/2.4/programs/ab.html" target="_blank">Apache Benchmarking Tool</a> and <a href="https://github.com/cmpxchg16/gobench" target="_blank">goBench</a> did not work for me. I got more lucky with <a href="https://github.com/wg/wrk" target="_blank">wrk</a>.
+</p>
+
+<h2>Test Setup</h2>
+<p style="text-align: justified;">
+I configured the API endpoint with a rate limit of 100 and a burst of 200 requests / second.
+</p>
+<p style="text-align: justified;">
+Different test runs have been done through a non-saturated home ADSL connection. Apart from my home ADSL connection, I also spawned a Digital Ocean droplet in the London Data Center. The API Gateway was configured in the eu-west region in Ireland. Test results from both sites (Toulouse Area via local ISP, London Area Digital Ocean Droplet) are comparable.
+</p>
+
+<h2>Test 1: 8 concurrent connections</h2>
+<p style="text-align: justified;">
+80.5 req/s. We are getting close to the the rate limit. Latency for the 90th percentile appears to be high.
+</p>
+<pre lang="shell" line="1" escaped="true">
+➜ virtualdisks docker run --rm williamyeh/wrk -c 8 -t 1 -d 60s --latency https://ph6oo2np9a.execute-api.eu-west-1.amazonaws.com/prd/hello/bert
+Running 1m test @ https://ph6oo2np9a.execute-api.eu-west-1.amazonaws.com/prd/hello/bert
+1 threads and 8 connections
+Thread Stats Avg Stdev Max +/- Stdev
+Latency 124.92ms 144.94ms 1.41s 93.52%
+Req/Sec 82.07 23.87 141.00 70.74%
+Latency Distribution
+50% 77.97ms
+75% 106.22ms
+90% 160.59ms
+99% 878.88ms
+4836 requests in 1.00m, 1.78MB read
+Requests/sec: 80.52
+Transfer/sec: 30.27KB
+</pre>
+
+<h2>Test 2: 14 concurrent connections</h2>
+<p style="text-align: justified;">
+As expected, the rate limit kicks in. We have 2993 of 9146 requests with a non-2xx or 3xx response. Latency at the 90th percentile is 144 ms.
+</p>
+<p style="text-align: justified;">
+<code>9146 - 2993 = 6153 req/minute = 102.5 req/s</code>
+</p>
+<pre lang="shell" line="1" escaped="true">
+➜ virtualdisks docker run --rm williamyeh/wrk -c 14 -t 1 -d 60s --latency https://ph6oo2np9a.execute-api.eu-west-1.amazonaws.com/prd/hello/bert
+Running 1m test @ https://ph6oo2np9a.execute-api.eu-west-1.amazonaws.com/prd/hello/bert
+1 threads and 14 connections
+Thread Stats Avg Stdev Max +/- Stdev
+Latency 118.14ms 146.95ms 1.48s 93.70%
+Req/Sec 153.46 34.74 240.00 72.36%
+Latency Distribution
+50% 75.28ms
+75% 87.52ms
+90% 144.13ms
+99% 892.30ms
+9146 requests in 1.00m, 3.38MB read
+Non-2xx or 3xx responses: 2993
+Requests/sec: 152.29
+Transfer/sec: 57.59KB
+</pre>
+
+<h2>Analysis</h2>
+<p style="text-align: justified;">
+Different load tests showed that rate limiting in the API Gateway works as expected. Interestingly, the overall latency appears to be relatively high (generally &gt; 130ms in the 90th percentile).
+</p>
+<p style="text-align: justified;">
+I conducted tests through two distinct ISPs with similar results. Given that our lambda operates in the sub-millisecond range, latency must come from the API Gateway's SSL termination, routing and mapping infrastructure.
+</p>
+
+<h1>The final word</h1>
+<p style="text-align: justified;">
+In conclusion, the API Gateway is a precious component in a Serverless Architecture, allowing the declarative construction of an API façade in front of BaaS and FaaS components. It also integrates well with third party authentication providers, such as <a href="https://auth0.com/" target="_blank">Auth0</a>. However, its latency surprised me a little bit.
+</p>
+<p style="text-align: justified;">
+Building a FaaS with Amazon Lambda is quite easy. Its an amazing building block for all kinds of architectures, including Serverless ones.
+</p>
+<p style="text-align: justified;">
+While this blog post only showed its deployment through the AWS console, deployment can also be automated through Amazon's command line interface and deployment APIs, allowing for eased integration into a Continuous Delivery pipeline.
+</p>
